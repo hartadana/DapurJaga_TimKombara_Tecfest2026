@@ -1,0 +1,207 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+
+#define MODE_SIMULASI 1
+#if MODE_SIMULASI
+const unsigned long T_HILANG   = 4000UL;
+const unsigned long T_WASPADA  = 10000UL;
+const unsigned long T_BAHAYA   = 25000UL;
+#else
+const unsigned long T_HILANG   = 60000UL;
+const unsigned long T_WASPADA  = 300000UL;
+const unsigned long T_BAHAYA   = 600000UL;
+#endif
+
+const float SUHU_AKTIF   = 40.0;
+const float SUHU_BAHAYA  = 60.0;
+const int   GAS_WASPADA  = 40;
+const int   GAS_BAHAYA   = 70;
+const unsigned long T_TAHAN_TOMBOL = 3000UL;
+
+const int PIN_DHT    = 4;
+const int PIN_PIR    = 27;
+const int PIN_GAS    = 34;
+const int PIN_TOMBOL = 14;
+const int PIN_LED_H  = 25;
+const int PIN_LED_K  = 26;
+const int PIN_LED_M  = 33;
+const int PIN_BUZZER = 32;
+const int PIN_SERVO  = 18;
+
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+const char* MQTT_HOST = "broker.hivemq.com";
+const int   MQTT_PORT = 1883;
+const char* TOPIK_STATUS  = "dapurjaga/tecfest2026/unit01/status";
+const char* TOPIK_PERINTAH = "dapurjaga/tecfest2026/unit01/perintah";
+
+enum Status { AMAN, MEMASAK, WASPADA, BAHAYA };
+const char* NAMA_STATUS[] = { "AMAN", "MEMASAK", "WASPADA", "BAHAYA" };
+
+DHT dht(PIN_DHT, DHT22);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo servoKatup;
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+
+float suhu = 25.0;
+int gasIdx = 0;
+bool orangAda = true;
+bool katupTerkunci = false;
+Status status = AMAN, statusLama = AMAN;
+unsigned long gerakTerakhir = 0, tTakTerawasi = 0;
+unsigned long tDHT = 0, tLCD = 0, tMQTT = 0, tCoba = 0, tSerial = 0, tBlink = 0, tBuz = 0;
+unsigned long tombolMulai = 0;
+bool tombolTekan = false, blinkOn = false;
+int servoPos = -1;
+
+int bacaGas() {
+  long jumlah = 0;
+  for (int i = 0; i < 8; i++) jumlah += analogRead(PIN_GAS);
+  return (int)((jumlah / 8) * 100L / 4095L);
+}
+
+void aturServo(int sudut) {
+  if (sudut != servoPos) { servoKatup.write(sudut); servoPos = sudut; }
+}
+
+void terimaPerintah(char* topik, byte* data, unsigned int len) {
+  String isi;
+  for (unsigned int i = 0; i < len; i++) isi += (char)data[i];
+  if (isi == "TUTUP") katupTerkunci = true;
+}
+
+void sambungMQTT() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (millis() - tCoba < 5000UL) return;
+  tCoba = millis();
+  String id = "dapurjaga-" + String((uint32_t)esp_random(), HEX);
+  if (mqtt.connect(id.c_str())) mqtt.subscribe(TOPIK_PERINTAH);
+}
+
+void kirimStatus() {
+  if (!mqtt.connected()) return;
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "{\"status\":\"%s\",\"suhu\":%.1f,\"gas\":%d,\"orang\":%d,\"tak_terawasi_s\":%lu,\"katup\":\"%s\"}",
+           NAMA_STATUS[status], suhu, gasIdx, orangAda ? 1 : 0, tTakTerawasi / 1000UL,
+           katupTerkunci ? "TUTUP" : "BUKA");
+  mqtt.publish(TOPIK_STATUS, buf);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_PIR, INPUT);
+  pinMode(PIN_TOMBOL, INPUT_PULLUP);
+  pinMode(PIN_LED_H, OUTPUT); pinMode(PIN_LED_K, OUTPUT); pinMode(PIN_LED_M, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  analogReadResolution(12);
+
+  dht.begin();
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("DapurJaga");
+  lcd.setCursor(0, 1); lcd.print("Memulai...");
+
+  servoKatup.setPeriodHertz(50);
+  servoKatup.attach(PIN_SERVO, 500, 2400);
+  aturServo(0);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setSocketTimeout(2);
+  mqtt.setCallback(terimaPerintah);
+
+  gerakTerakhir = millis();
+  delay(1000);
+  lcd.clear();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - tDHT >= 2000UL) {
+    tDHT = now;
+    float t = dht.readTemperature();
+    if (!isnan(t)) suhu = t;
+  }
+  gasIdx = bacaGas();
+  if (digitalRead(PIN_PIR) == HIGH) gerakTerakhir = now;
+
+  bool tekan = (digitalRead(PIN_TOMBOL) == LOW);
+  if (tekan && !tombolTekan) tombolMulai = now;
+  if (tekan && katupTerkunci && (now - tombolMulai >= T_TAHAN_TOMBOL)) {
+    if (gasIdx < GAS_WASPADA && suhu < SUHU_AKTIF) {
+      katupTerkunci = false;
+      gerakTerakhir = now;
+    }
+  }
+  if (!tekan && tombolTekan && (now - tombolMulai < T_TAHAN_TOMBOL)) gerakTerakhir = now;
+  tombolTekan = tekan;
+
+  bool kompor = (suhu >= SUHU_AKTIF);
+  if (!kompor) gerakTerakhir = now; 
+  unsigned long sejakGerak = now - gerakTerakhir;
+  orangAda = (sejakGerak < T_HILANG);
+  tTakTerawasi = kompor ? sejakGerak : 0;
+
+  bool bahaya = katupTerkunci || gasIdx >= GAS_BAHAYA || suhu >= SUHU_BAHAYA ||
+                (kompor && tTakTerawasi >= T_BAHAYA);
+  if (bahaya) {
+    katupTerkunci = true;
+    status = BAHAYA;
+  } else if (gasIdx >= GAS_WASPADA || (kompor && tTakTerawasi >= T_WASPADA)) {
+    status = WASPADA;
+  } else if (kompor) {
+    status = MEMASAK;
+  } else {
+    status = AMAN;
+  }
+
+  aturServo(katupTerkunci ? 90 : 0);
+  if (now - tBlink >= (status == BAHAYA ? 250UL : 500UL)) { tBlink = now; blinkOn = !blinkOn; }
+  digitalWrite(PIN_LED_H, status == AMAN || (status == MEMASAK && blinkOn));
+  digitalWrite(PIN_LED_K, status == WASPADA);
+  digitalWrite(PIN_LED_M, status == BAHAYA && blinkOn);
+
+  if (status == BAHAYA) {
+    if (now - tBuz >= 250UL) { tBuz = now; tone(PIN_BUZZER, blinkOn ? 2400 : 1800); }
+  } else if (status == WASPADA) {
+    unsigned long fase = now % 2000UL;
+    if (fase < 200UL) tone(PIN_BUZZER, 2000); else noTone(PIN_BUZZER);
+  } else {
+    noTone(PIN_BUZZER);
+  }
+
+  if (now - tLCD >= 500UL) {
+    tLCD = now;
+    char b1[17], b2[17];
+    if (status == AMAN)         snprintf(b1, sizeof(b1), "%-16s", "DAPUR AMAN");
+    else if (status == MEMASAK) snprintf(b1, sizeof(b1), "%-16s", "MEMASAK: DIJAGA");
+    else if (status == WASPADA) snprintf(b1, sizeof(b1), "%-16s", gasIdx >= GAS_WASPADA ? "WASPADA: GAS!" : "TAK TERAWASI!");
+    else                        snprintf(b1, sizeof(b1), "%-16s", "BAHAYA:KATUP OFF");
+    snprintf(b2, sizeof(b2), "%2.0fC G%3d%% %-5s", suhu, gasIdx, orangAda ? "ADA" : "---");
+    lcd.setCursor(0, 0); lcd.print(b1);
+    lcd.setCursor(0, 1); lcd.print(b2);
+  }
+
+  sambungMQTT();
+  mqtt.loop();
+  if (status != statusLama || now - tMQTT >= 5000UL) {
+    tMQTT = now;
+    statusLama = status;
+    kirimStatus();
+  }
+
+  if (now - tSerial >= 1000UL) {
+    tSerial = now;
+    Serial.printf("[%s] suhu=%.1f gas=%d%% orang=%d tak_terawasi=%lus katup=%s\n",
+                  NAMA_STATUS[status], suhu, gasIdx, orangAda ? 1 : 0, tTakTerawasi / 1000UL,
+                  katupTerkunci ? "TUTUP" : "BUKA");
+  }
+  delay(20);
+}
