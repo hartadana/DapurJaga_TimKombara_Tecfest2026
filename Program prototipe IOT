@@ -1,5 +1,3 @@
-#include <WiFi.h>
-#include <PubSubClient.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
@@ -7,18 +5,18 @@
 
 #define MODE_SIMULASI 1
 #if MODE_SIMULASI
-const unsigned long T_HILANG   = 4000UL;
-const unsigned long T_WASPADA  = 10000UL;
-const unsigned long T_BAHAYA   = 25000UL;
+const unsigned long T_HILANG   = 4000UL;    
+const unsigned long T_WASPADA  = 10000UL;   
+const unsigned long T_BAHAYA   = 25000UL;   
 #else
 const unsigned long T_HILANG   = 60000UL;
-const unsigned long T_WASPADA  = 300000UL;
-const unsigned long T_BAHAYA   = 600000UL;
+const unsigned long T_WASPADA  = 300000UL; 
+const unsigned long T_BAHAYA   = 600000UL;  
 #endif
 
-const float SUHU_AKTIF   = 40.0;
+const float SUHU_AKTIF   = 40.0; 
 const float SUHU_BAHAYA  = 60.0;
-const int   GAS_WASPADA  = 40;
+const int   GAS_WASPADA  = 40;    
 const int   GAS_BAHAYA   = 70;
 const unsigned long T_TAHAN_TOMBOL = 3000UL;
 
@@ -32,29 +30,20 @@ const int PIN_LED_M  = 33;
 const int PIN_BUZZER = 32;
 const int PIN_SERVO  = 18;
 
-const char* WIFI_SSID = "Wokwi-GUEST";
-const char* WIFI_PASS = "";
-const char* MQTT_HOST = "broker.hivemq.com";
-const int   MQTT_PORT = 1883;
-const char* TOPIK_STATUS  = "dapurjaga/tecfest2026/unit01/status";
-const char* TOPIK_PERINTAH = "dapurjaga/tecfest2026/unit01/perintah";
-
 enum Status { AMAN, MEMASAK, WASPADA, BAHAYA };
 const char* NAMA_STATUS[] = { "AMAN", "MEMASAK", "WASPADA", "BAHAYA" };
 
 DHT dht(PIN_DHT, DHT22);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Servo servoKatup;
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
 
 float suhu = 25.0;
 int gasIdx = 0;
 bool orangAda = true;
 bool katupTerkunci = false;
-Status status = AMAN, statusLama = AMAN;
+Status status = AMAN;
 unsigned long gerakTerakhir = 0, tTakTerawasi = 0;
-unsigned long tDHT = 0, tLCD = 0, tMQTT = 0, tCoba = 0, tSerial = 0, tBlink = 0, tBuz = 0;
+unsigned long tDHT = 0, tLCD = 0, tSerial = 0, tBlink = 0, tBuz = 0;
 unsigned long tombolMulai = 0;
 bool tombolTekan = false, blinkOn = false;
 int servoPos = -1;
@@ -67,30 +56,6 @@ int bacaGas() {
 
 void aturServo(int sudut) {
   if (sudut != servoPos) { servoKatup.write(sudut); servoPos = sudut; }
-}
-
-void terimaPerintah(char* topik, byte* data, unsigned int len) {
-  String isi;
-  for (unsigned int i = 0; i < len; i++) isi += (char)data[i];
-  if (isi == "TUTUP") katupTerkunci = true;
-}
-
-void sambungMQTT() {
-  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
-  if (millis() - tCoba < 5000UL) return;
-  tCoba = millis();
-  String id = "dapurjaga-" + String((uint32_t)esp_random(), HEX);
-  if (mqtt.connect(id.c_str())) mqtt.subscribe(TOPIK_PERINTAH);
-}
-
-void kirimStatus() {
-  if (!mqtt.connected()) return;
-  char buf[160];
-  snprintf(buf, sizeof(buf),
-           "{\"status\":\"%s\",\"suhu\":%.1f,\"gas\":%d,\"orang\":%d,\"tak_terawasi_s\":%lu,\"katup\":\"%s\"}",
-           NAMA_STATUS[status], suhu, gasIdx, orangAda ? 1 : 0, tTakTerawasi / 1000UL,
-           katupTerkunci ? "TUTUP" : "BUKA");
-  mqtt.publish(TOPIK_STATUS, buf);
 }
 
 void setup() {
@@ -108,13 +73,7 @@ void setup() {
 
   servoKatup.setPeriodHertz(50);
   servoKatup.attach(PIN_SERVO, 500, 2400);
-  aturServo(0);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS, 6);
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setSocketTimeout(2);
-  mqtt.setCallback(terimaPerintah);
+  aturServo(0);                                
 
   gerakTerakhir = millis();
   delay(1000);
@@ -124,7 +83,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  if (now - tDHT >= 2000UL) {
+  if (now - tDHT >= 2000UL) {                    
     tDHT = now;
     float t = dht.readTemperature();
     if (!isnan(t)) suhu = t;
@@ -144,7 +103,7 @@ void loop() {
   tombolTekan = tekan;
 
   bool kompor = (suhu >= SUHU_AKTIF);
-  if (!kompor) gerakTerakhir = now; 
+  if (!kompor) gerakTerakhir = now;              
   unsigned long sejakGerak = now - gerakTerakhir;
   orangAda = (sejakGerak < T_HILANG);
   tTakTerawasi = kompor ? sejakGerak : 0;
@@ -187,14 +146,6 @@ void loop() {
     snprintf(b2, sizeof(b2), "%2.0fC G%3d%% %-5s", suhu, gasIdx, orangAda ? "ADA" : "---");
     lcd.setCursor(0, 0); lcd.print(b1);
     lcd.setCursor(0, 1); lcd.print(b2);
-  }
-
-  sambungMQTT();
-  mqtt.loop();
-  if (status != statusLama || now - tMQTT >= 5000UL) {
-    tMQTT = now;
-    statusLama = status;
-    kirimStatus();
   }
 
   if (now - tSerial >= 1000UL) {
